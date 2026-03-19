@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import sys
-from functools import partial
+from functools import lru_cache, partial
 
 import jsonschema
 import yaml
@@ -35,7 +35,32 @@ from kapitan.utils import (
 
 logger = logging.getLogger(__name__)
 
-JSONNET_CACHE = {}
+_JSONNET_CACHE_MAXSIZE = 512  # maximum number of cached jsonnet file contents
+JSONNET_CACHE = {}  # kept for external compatibility; eviction managed by _read_jsonnet_file
+
+
+@lru_cache(maxsize=_JSONNET_CACHE_MAXSIZE)
+def _read_file_cached(path):
+    """Read a file from disk, caching up to _JSONNET_CACHE_MAXSIZE unique paths.
+
+    LRU eviction prevents unbounded memory growth during large compilations.
+    """
+    with open(path) as f:
+        return f.read()
+
+
+@lru_cache(maxsize=None)
+def _resolve_file_in_search_paths(search_paths_tuple, name):
+    """Cache-friendly helper: resolves a filename to its full path across search paths.
+
+    Returns the full path if found, else None.  Results are cached per
+    (search_paths, name) pair so repeated lookups skip os.path.exists() calls.
+    """
+    for path in search_paths_tuple:
+        full_path = os.path.join(path, name)
+        if os.path.exists(full_path):
+            return full_path
+    return None
 
 yaml.SafeDumper.add_multi_representer(
     StrEnum,
@@ -118,64 +143,56 @@ def jinja2_render_file(search_paths, name, ctx):
     one can't access the current directory being evaluated
     """
     ctx = json.loads(ctx)
-    _full_path = ""
 
-    for path in search_paths:
-        _full_path = os.path.join(path, name)
-        logger.debug("jinja2_render_file trying file %s", _full_path)
-        if os.path.exists(_full_path):
-            logger.debug("jinja2_render_file found file at %s", _full_path)
-            try:
-                return render_jinja2_file(_full_path, ctx, search_paths=search_paths)
-            except Exception as e:
-                raise CompileError(f"Jsonnet jinja2 failed to render {_full_path}: {e}")
+    _full_path = _resolve_file_in_search_paths(tuple(search_paths), name)
+    if _full_path is not None:
+        logger.debug("jinja2_render_file found file at %s", _full_path)
+        try:
+            return render_jinja2_file(_full_path, ctx, search_paths=search_paths)
+        except Exception as e:
+            raise CompileError(f"Jsonnet jinja2 failed to render {_full_path}: {e}")
 
-    raise OSError(f"jinja2 failed to render, could not find file: {_full_path}")
+    raise OSError(f"jinja2 failed to render, could not find file: {name}")
 
 
 def yaml_load(search_paths, name):
     """returns content of yaml file as json string"""
-    for path in search_paths:
-        _full_path = os.path.join(path, name)
-        logger.debug("yaml_load trying file %s", _full_path)
-        if os.path.exists(_full_path) and name.endswith((".yml", ".yaml")):
-            logger.debug("yaml_load found file at %s", _full_path)
-            try:
-                with open(_full_path) as f:
-                    return json.dumps(yaml.safe_load(f.read()))
-            except Exception as e:
-                raise CompileError(f"Parse yaml failed to parse {_full_path}: {e}")
-
-    raise OSError(f"could not find any input yaml file: {_full_path}")
+    if not name.endswith((".yml", ".yaml")):
+        raise OSError(f"could not find any input yaml file: {name}")
+    _full_path = _resolve_file_in_search_paths(tuple(search_paths), name)
+    if _full_path is not None:
+        logger.debug("yaml_load found file at %s", _full_path)
+        try:
+            with open(_full_path) as f:
+                return json.dumps(yaml.safe_load(f.read()))
+        except Exception as e:
+            raise CompileError(f"Parse yaml failed to parse {_full_path}: {e}")
+    raise OSError(f"could not find any input yaml file: {name}")
 
 
 def yaml_load_stream(search_paths, name):
     """returns contents of yaml file as generator"""
-    for path in search_paths:
-        _full_path = os.path.join(path, name)
-        logger.debug("yaml_load_stream trying file %s", _full_path)
-        if os.path.exists(_full_path) and name.endswith((".yml", ".yaml")):
-            logger.debug("yaml_load_stream found file at %s", _full_path)
-            try:
-                with open(_full_path) as f:
-                    _obj = yaml.load_all(f.read(), Loader=yaml.SafeLoader)
-                    return json.dumps(list(_obj))
-            except Exception as e:
-                raise CompileError(f"Parse yaml failed to parse {_full_path}: {e}")
-
-    raise OSError(f"could not find any input yaml file: {_full_path}")
+    if not name.endswith((".yml", ".yaml")):
+        raise OSError(f"could not find any input yaml file: {name}")
+    _full_path = _resolve_file_in_search_paths(tuple(search_paths), name)
+    if _full_path is not None:
+        logger.debug("yaml_load_stream found file at %s", _full_path)
+        try:
+            with open(_full_path) as f:
+                _obj = yaml.load_all(f.read(), Loader=yaml.SafeLoader)
+                return json.dumps(list(_obj))
+        except Exception as e:
+            raise CompileError(f"Parse yaml failed to parse {_full_path}: {e}")
+    raise OSError(f"could not find any input yaml file: {name}")
 
 
 def read_file(search_paths, name):
     """return content of file in name"""
-    for path in search_paths:
-        full_path = os.path.join(path, name)
-        logger.debug("read_file trying file %s", full_path)
-        if os.path.exists(full_path):
-            logger.debug("read_file found file at %s", full_path)
-            with open(full_path, newline="") as f:
-                return f.read()
-
+    full_path = _resolve_file_in_search_paths(tuple(search_paths), name)
+    if full_path is not None:
+        logger.debug("read_file found file at %s", full_path)
+        with open(full_path, newline="") as f:
+            return f.read()
     raise OSError(f"Could not find file {name}")
 
 
@@ -183,13 +200,10 @@ def file_exists(search_paths, name):
     """returns an object with keys:
     - exists (true/false)
     - path (will have the full path where the file was found)"""
-    for path in search_paths:
-        full_path = os.path.join(path, name)
-        logger.debug("file_exists trying file %s", full_path)
-        if os.path.exists(full_path):
-            logger.debug("file_exists found file at %s", full_path)
-            return {"exists": True, "path": full_path}
-
+    full_path = _resolve_file_in_search_paths(tuple(search_paths), name)
+    if full_path is not None:
+        logger.debug("file_exists found file at %s", full_path)
+        return {"exists": True, "path": full_path}
     return {"exists": False, "path": ""}
 
 
@@ -233,9 +247,6 @@ def search_imports(cwd, import_str, search_paths):
     basename = os.path.basename(import_str)
     full_import_path = os.path.normpath(os.path.join(cwd, import_str))
 
-    if full_import_path in JSONNET_CACHE:
-        return full_import_path, JSONNET_CACHE[full_import_path].encode()
-
     if not os.path.exists(full_import_path):
         # if import_str not found, search in install_path
         install_path = os.path.dirname(kapitan_install_path)
@@ -270,10 +281,9 @@ def search_imports(cwd, import_str, search_paths):
         normalised_path,
     )
 
-    normalised_path_content = ""
-    with open(normalised_path) as f:
-        normalised_path_content = f.read()
-        JSONNET_CACHE[normalised_path] = normalised_path_content
+    normalised_path_content = _read_file_cached(normalised_path)
+    # Keep JSONNET_CACHE in sync for external consumers that inspect it directly
+    JSONNET_CACHE[normalised_path] = normalised_path_content
 
     return normalised_path, normalised_path_content.encode()
 

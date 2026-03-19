@@ -7,11 +7,11 @@
 
 import abc
 import glob
-import itertools
 import json
 import logging
 import os
 from collections.abc import Mapping
+from functools import lru_cache
 
 import toml
 import yaml
@@ -24,6 +24,20 @@ from kapitan.utils import PrettyDumper, prune_empty
 
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1024)
+def _glob_expand(search_paths_tuple, input_path):
+    """Return frozenset of paths matched by glob-expanding input_path across search_paths.
+
+    Results are cached per (search_paths, input_path) pair so that targets
+    sharing the same search paths and input globs avoid redundant filesystem
+    scans on subsequent compilations within the same process.
+    """
+    results = []
+    for path in search_paths_tuple:
+        results.extend(glob.glob(os.path.join(path, input_path)))
+    return frozenset(results)
 
 
 class InputType:
@@ -77,10 +91,7 @@ class InputType:
 
         """
         for input_path in comp_obj.input_paths:
-            globbed_paths = [
-                glob.glob(os.path.join(path, input_path)) for path in self.search_paths
-            ]
-            expanded_paths = set(itertools.chain.from_iterable(globbed_paths))
+            expanded_paths = _glob_expand(tuple(self.search_paths), input_path)
 
             if not expanded_paths and not comp_obj.ignore_missing:
                 raise CompileError(
