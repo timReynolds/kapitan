@@ -51,6 +51,51 @@ except ImportError:
     from yaml import SafeLoader as YamlLoader
 
 
+def available_cpu_count() -> int:
+    """Return the number of CPUs available to this process.
+
+    Checks Linux cgroup v2 and v1 CPU quota files and process affinity before
+    falling back to os.cpu_count() so the result is correct inside containers
+    that have a CPU quota smaller than the host's physical core count.
+    """
+    # cgroup v2
+    try:
+        quota_path = "/sys/fs/cgroup/cpu.max"
+        if os.path.exists(quota_path):
+            with open(quota_path) as f:
+                contents = f.read().split()
+            if contents[0] != "max":
+                quota = int(contents[0])
+                period = int(contents[1])
+                cpus = max(1, math.floor(quota / period))
+                return cpus
+    except (OSError, ValueError, IndexError):
+        pass
+
+    # cgroup v1
+    try:
+        quota_path = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+        period_path = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+        if os.path.exists(quota_path) and os.path.exists(period_path):
+            with open(quota_path) as f:
+                quota = int(f.read().strip())
+            with open(period_path) as f:
+                period = int(f.read().strip())
+            if quota > 0:
+                cpus = max(1, math.floor(quota / period))
+                return cpus
+    except (OSError, ValueError):
+        pass
+
+    # process affinity (Linux)
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        pass
+
+    return os.cpu_count() or 1
+
+
 def fatal_error(message):
     "Logs error message, sys.exit(1)"
     logger.error(message)
