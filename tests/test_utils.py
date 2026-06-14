@@ -379,13 +379,17 @@ class AvailableCpuCountTest(unittest.TestCase):
 
     def test_cgroup_v2_quota(self):
         cgroup_v2_content = "200000 100000\n"
-        with patch("os.path.exists", side_effect=lambda p: p == "/sys/fs/cgroup/cpu.max"):
+        with patch(
+            "os.path.exists", side_effect=lambda p: p == "/sys/fs/cgroup/cpu.max"
+        ):
             with patch("builtins.open", mock_open(read_data=cgroup_v2_content)):
                 result = available_cpu_count()
         self.assertEqual(result, 2)
 
     def test_cgroup_v2_unlimited(self):
-        with patch("os.path.exists", side_effect=lambda p: p == "/sys/fs/cgroup/cpu.max"):
+        with patch(
+            "os.path.exists", side_effect=lambda p: p == "/sys/fs/cgroup/cpu.max"
+        ):
             with patch("builtins.open", mock_open(read_data="max 100000\n")):
                 with patch("os.sched_getaffinity", return_value={0, 1, 2, 3}):
                     result = available_cpu_count()
