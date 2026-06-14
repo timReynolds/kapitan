@@ -13,9 +13,11 @@ import shutil
 import stat
 import tempfile
 import unittest
+from unittest.mock import mock_open, patch
 
 from kapitan.utils import (
     SafeCopyError,
+    available_cpu_count,
     compare_versions,
     copy_tree,
     deep_get,
@@ -365,3 +367,63 @@ class CompareVersionsTest(unittest.TestCase):
 
     def test_compare_versions_major_diff(self):
         self.assertEqual(compare_versions("2.0.0", "1.9.9"), "greater")
+
+
+class AvailableCpuCountTest(unittest.TestCase):
+    "Test available_cpu_count function"
+
+    def test_returns_positive_integer(self):
+        result = available_cpu_count()
+        self.assertIsInstance(result, int)
+        self.assertGreaterEqual(result, 1)
+
+    def test_cgroup_v2_quota(self):
+        cgroup_v2_content = "200000 100000\n"
+        with patch(
+            "os.path.exists", side_effect=lambda p: p == "/sys/fs/cgroup/cpu.max"
+        ):
+            with patch("builtins.open", mock_open(read_data=cgroup_v2_content)):
+                result = available_cpu_count()
+        self.assertEqual(result, 2)
+
+    def test_cgroup_v2_unlimited(self):
+        with patch(
+            "os.path.exists", side_effect=lambda p: p == "/sys/fs/cgroup/cpu.max"
+        ):
+            with patch("builtins.open", mock_open(read_data="max 100000\n")):
+                with patch("os.sched_getaffinity", return_value={0, 1, 2, 3}):
+                    result = available_cpu_count()
+        self.assertEqual(result, 4)
+
+    def test_cgroup_v1_quota(self):
+        def exists_side_effect(p):
+            return p in (
+                "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+                "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+            )
+
+        quota_mock = mock_open(read_data="300000\n")
+        period_mock = mock_open(read_data="100000\n")
+
+        def open_side_effect(path, *args, **kwargs):
+            if "quota" in path:
+                return quota_mock()
+            return period_mock()
+
+        with patch("os.path.exists", side_effect=exists_side_effect):
+            with patch("builtins.open", side_effect=open_side_effect):
+                result = available_cpu_count()
+        self.assertEqual(result, 3)
+
+    def test_affinity_fallback(self):
+        with patch("os.path.exists", return_value=False):
+            with patch("os.sched_getaffinity", return_value={0, 1}):
+                result = available_cpu_count()
+        self.assertEqual(result, 2)
+
+    def test_os_cpu_count_fallback(self):
+        with patch("os.path.exists", return_value=False):
+            with patch("os.sched_getaffinity", side_effect=AttributeError):
+                with patch("os.cpu_count", return_value=8):
+                    result = available_cpu_count()
+        self.assertEqual(result, 8)
